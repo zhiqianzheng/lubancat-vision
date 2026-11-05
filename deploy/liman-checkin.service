@@ -1,0 +1,23 @@
+[Unit]
+Description=Liman local QR attendance desktop
+After=lightdm.service rkaiq_3A.service
+Wants=lightdm.service rkaiq_3A.service
+
+[Service]
+Type=simple
+User=cat
+Group=cat
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/cat/.Xauthority
+Environment=PYTHONUNBUFFERED=1
+Environment=LIMAN_CAMERA_FILL=1
+Environment=LIMAN_CAMERA_FULLSCREEN=1
+UMask=0077
+ExecStartPre=/usr/bin/python3 /opt/liman-checkin/wait_display.py
+MemoryMax=1G
+ExecStart=/usr/bin/python3 /opt/liman-checkin/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
