@@ -858,6 +858,9 @@ class App(Gtk.Window):
             text = '手势：正在加载模型…'
         elif self.gesture_notice and time.monotonic() < self.gesture_notice_until:
             text = '手势控制：' + self.gesture_notice
+        elif result is not None and result.get('number') is not None:
+            text = '手势：数字 {}'.format(result['number'])
+            if result['label']:text += ' · ' + result['label']
         elif result is not None and result['label']:
             text = '手势：' + result['label']
         elif result is not None:

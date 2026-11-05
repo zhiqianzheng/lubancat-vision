@@ -3,6 +3,18 @@ HAND_CONNECTIONS = [(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
                     (13,17),(0,17),(17,18),(18,19),(19,20)]
 
 
+class StableHandNumber:
+    """Require consecutive model samples; never carry a digit across hand loss."""
+    def __init__(self):self.reset()
+    def reset(self):self.candidate=None;self.since=0.;self.last=None;self.samples=0
+    def update(self, number, now):
+        if number not in (1,2,3,4,5):self.reset();return None
+        if number!=self.candidate or self.last is None or now-self.last>1.:
+            self.candidate=number;self.since=now;self.samples=0
+        self.last=now;self.samples+=1
+        return number if self.samples>=2 and now-self.since>=.18 else None
+
+
 class CoveredLensReset:
     """One reset per sustained dark cover, using fresh camera frames only."""
     def __init__(self, hold=1.2):

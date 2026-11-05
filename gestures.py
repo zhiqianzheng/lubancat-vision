@@ -35,9 +35,9 @@ def Network(path):
     return LiteNetwork(path)
 
 
-def classify(points):
+def describe_hand(points):
     p = np.asarray(points, dtype=np.float32)
-    if p.shape != (21,3) or not np.isfinite(p).all(): return ''
+    if p.shape != (21,3) or not np.isfinite(p).all(): return {'label':'','number':None}
     def distance(a,b): return float(np.linalg.norm(p[a]-p[b]))
     def straight(a,b,c):
         u,v=p[a]-p[b],p[c]-p[b]
@@ -50,13 +50,24 @@ def classify(points):
     palm=max(distance(0,9),distance(5,17),1.)
     thumb=(straight(1,2,4) and distance(4,5)>.55*palm
            and distance(4,0)>1.1*distance(2,0))
-    if all(extended): return '张开手掌'
-    if extended == [True,True,False,False]: return '胜利手势'
-    if extended == [True,False,False,False]: return '食指向上'
+    label='';number=None
+    if all(extended):
+        label='张开手掌';number=5 if thumb else 4
+    elif extended == [True,True,False,False]:
+        label='胜利手势'
+        if not thumb:number=2
+    elif extended == [True,False,False,False]:
+        label='食指向上'
+        if not thumb:number=1
+    elif extended == [True,True,True,False] and not thumb:number=3
     if not any(extended):
-        if thumb and p[4,1] < p[2,1]-.30*palm: return '点赞'
-        if not thumb: return '握拳'
-    return ''
+        if thumb and p[4,1] < p[2,1]-.30*palm:label='点赞'
+        if not thumb:label='握拳'
+    return {'label':label,'number':number}
+
+
+def classify(points):
+    return describe_hand(points)['label']
 
 
 class GestureDetector:
@@ -122,5 +133,5 @@ class GestureDetector:
         if np.min(hi-lo)<8 or not np.isfinite(points).all():
             self.tracked=None;return None
         self.tracked=np.r_[lo,hi,palm_points.reshape(-1),result[-1]]
-        return {'points':points.copy(),'box':result[:4].copy(),
-                'label':classify(points),'confidence':float(result[-1])}
+        return dict(describe_hand(points),points=points.copy(),box=result[:4].copy(),
+                    confidence=float(result[-1]))
