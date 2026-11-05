@@ -3,6 +3,23 @@ HAND_CONNECTIONS = [(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
                     (13,17),(0,17),(17,18),(18,19),(19,20)]
 
 
+class DoublePalmStop:
+    """Require fresh, distinct two-open-hand observations before a clean exit."""
+    def __init__(self, hold=2.):self.hold=hold;self.reset()
+    def reset(self):self.since=None;self.last=None;self.sample=None;self.samples=0
+    def update(self,result,now):
+        if self.last is not None and now-self.last>1.2:self.reset()
+        if result is None:self.reset();return False
+        sample=result.get('sample_id')
+        if sample is None or sample==self.sample:return False
+        self.sample=sample
+        if not result.get('stop_checked'):return False
+        if not result.get('stop'):self.reset();return False
+        if self.since is None:self.since=now
+        self.last=now;self.samples+=1
+        return self.samples>=3 and now-self.since>=self.hold
+
+
 class NumberOkSequence:
     """Select a stable digit, then confirm it with a separate stable OK pose."""
     def __init__(self, timeout=5.):self.timeout=timeout;self.reset()

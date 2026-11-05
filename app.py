@@ -19,7 +19,7 @@ gi.require_version('Gst', '1.0')
 gi.require_version('PangoCairo', '1.0')
 from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gst, Pango, PangoCairo
 from gesture_client import GestureWorker, HAND_CONNECTIONS
-from gesture_common import FullscreenGestureSequence, CoveredLensReset, NumberOkSequence
+from gesture_common import FullscreenGestureSequence, CoveredLensReset, NumberOkSequence, DoublePalmStop
 from visual_demo import VisualDemo
 from hand_motion import HandMotionWorker
 import cv2
@@ -256,8 +256,7 @@ class Camera(threading.Thread):
                     self.scans.submit(frame)
                 if self.app.demo.mode == 'body':
                     self.body.submit(frame)
-                elif self.app.demo.mode != 'scanner':
-                    self.gestures.submit(frame)
+                self.gestures.submit(frame)
                 if self.app.demo.mode == 'pinch':
                     self.motion.submit(frame)
                 frames += 1
@@ -308,6 +307,7 @@ class App(Gtk.Window):
         self.gesture_sequence = FullscreenGestureSequence()
         self.cover_reset = CoveredLensReset()
         self.mode_sequence = NumberOkSequence()
+        self.stop_sequence = DoublePalmStop()
         self.gesture_modes = {1:('paint','隔空画画'),2:('particles','掌心粒子'),
                               3:('pinch','捏合缩放'),4:('bricks','隔空打砖块'),5:('scanner','物体扫描仪')}
         self.demo = VisualDemo()
@@ -352,7 +352,7 @@ class App(Gtk.Window):
         controls.pack_start(self.video_stats, False, False, 0)
         self.gesture_toggle = Gtk.ToggleButton(label='手势识别')
         self.gesture_toggle.set_active(True)
-        self.gesture_toggle.set_tooltip_text('握拳→张开手掌进入全屏；张开手掌→握拳退出全屏。每个姿势稳定保持约一秒。')
+        self.gesture_toggle.set_tooltip_text('握拳→张开手掌进入全屏；张开手掌→握拳退出全屏。双手张掌保持约两秒退出程序；关闭普通手势后 STOP 仍可用。')
         self.gesture_toggle.connect('toggled', lambda *_: self.configure_interaction_workers())
         controls.pack_start(self.gesture_toggle, False, False, 0)
         self.demo_enable = Gtk.ToggleButton(label='互动：关')
@@ -662,6 +662,10 @@ class App(Gtk.Window):
         return False
 
     def paint(self):
+        stop, _, _ = self.camera.gestures.snapshot()
+        if self.stop_sequence.update(stop,time.monotonic()):
+            self.destroy()
+            return False
         self.apply_gesture_mode()
         self.apply_gesture_fullscreen()
         if self.demo.mode == 'body':
@@ -669,7 +673,7 @@ class App(Gtk.Window):
         elif self.demo.mode == 'scanner':
             result, enabled, error = None, True, ''
         else:
-            result, enabled, error = self.camera.gestures.snapshot()
+            result, enabled, error = self.hand_snapshot()
         if self.demo.mode == 'pinch':
             tracked = self.camera.motion.snapshot()
             if tracked is not None:result = tracked
@@ -742,7 +746,7 @@ class App(Gtk.Window):
                     cr.set_source_rgb(.025,.055,.075)
                     cr.move_to(tx+4, ty+3)
                     PangoCairo.show_layout(cr, layout)
-            gesture, enabled, error = self.camera.gestures.snapshot()
+            gesture, enabled, error = self.hand_snapshot()
             if gesture is not None and not self.demo.active:
                 points = gesture['points']
                 cr.set_source_rgb(1., .82, .2)
@@ -784,8 +788,11 @@ class App(Gtk.Window):
         if not hasattr(self, 'camera'):return
         hand = self.demo.mode in ('normal','paint','particles','pinch','bricks')
         self.gesture_toggle.set_sensitive(hand)
-        self.camera.gestures.set_enabled(hand and self.gesture_toggle.get_active())
-        self.camera.gestures.idle = .3 if self.demo.mode == 'paint' else 1.
+        monitor = not (hand and self.gesture_toggle.get_active())
+        self.camera.gestures.set_enabled(True)
+        self.camera.gestures.set_monitor_only(monitor)
+        self.camera.gestures.interval = .5 if monitor else .3
+        self.camera.gestures.idle = .5 if monitor else .3 if self.demo.mode == 'paint' else 1.
         self.camera.body.set_enabled(self.demo.mode == 'body')
         self.camera.motion.set_enabled(self.demo.mode == 'pinch' and self.gesture_toggle.get_active())
 
@@ -832,8 +839,13 @@ class App(Gtk.Window):
             self.message('识别卡片已保存',str(path))
         except Exception as exc:self.message('保存失败',str(exc))
 
-    def apply_gesture_mode(self):
+    def hand_snapshot(self):
         result, enabled, error = self.camera.gestures.snapshot()
+        enabled = enabled and self.gesture_toggle.get_active()
+        return result if enabled else None, enabled, error
+
+    def apply_gesture_mode(self):
+        result, enabled, error = self.hand_snapshot()
         number = self.mode_sequence.update(result, time.monotonic(),
             not self.demo.active and enabled and not error and not self.cover_reset.latched)
         if number is not None:
@@ -843,7 +855,7 @@ class App(Gtk.Window):
     def apply_gesture_fullscreen(self):
         if self.demo.active:
             return
-        result, enabled, error = self.camera.gestures.snapshot()
+        result, enabled, error = self.hand_snapshot()
         now = time.monotonic()
         action = self.gesture_sequence.update(
             result['label'] if result else '',
@@ -858,16 +870,19 @@ class App(Gtk.Window):
             self.gesture_notice_until = now + 1.8
 
     def gesture_status_text(self):
+        if self.stop_sequence.since is not None:
+            remaining=max(0.,self.stop_sequence.hold-(time.monotonic()-self.stop_sequence.since))
+            return '双手 STOP：保持 {:.1f} 秒退出程序 · 放下手取消'.format(remaining)
         if self.demo.active:
             worker = self.camera.body if self.demo.mode == 'body' else self.camera.gestures
             if self.demo.mode != 'scanner' and worker.enabled and not worker.loaded:
                 return '正在加载人体模型…' if self.demo.mode == 'body' else '正在加载手部模型…'
             return self.demo.status_text(time.monotonic())
-        result, enabled, error = self.camera.gestures.snapshot()
+        result, enabled, error = self.hand_snapshot()
         if error:
             text = '手势识别不可用：' + error[:100]
         elif not enabled:
-            text = '手势识别已关闭'
+            text = '手势识别已关闭 · 双手 STOP 仍可退出'
         elif not self.camera.gestures.loaded:
             text = '手势：正在加载模型…'
         elif self.mode_sequence.selected is not None:

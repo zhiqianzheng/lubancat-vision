@@ -33,9 +33,9 @@ class _FrameProcess:
                 if 'error' in value:raise RuntimeError(value['error'])
                 return value
         raise RuntimeError('识别进程响应超时')
-    def infer(self,frame,reset):
+    def infer(self,frame,reset,monitor_only=False):
         self.shared.seek(0);self.shared.write(memoryview(frame).cast('B'))
-        self.process.stdin.write(json.dumps({'reset':reset})+chr(10));self.process.stdin.flush()
+        self.process.stdin.write(json.dumps({'reset':reset,'monitor_only':monitor_only})+chr(10));self.process.stdin.flush()
         return self.reply(6)['result']
     def close(self):
         if self.process:
@@ -58,6 +58,12 @@ class GestureWorker(threading.Thread):
         self.frame=None;self.result=None;self.generated=0.;self.enabled=enabled
         self.loaded=False;self.error='';self.processed_frames=0;self.elapsed=0.;self.reset=True;self.generation=0
         self.process_pid=None
+        self.monitor_only=False
+
+    def set_monitor_only(self,enabled):
+        with self.lock:
+            if self.monitor_only==bool(enabled):return
+            self.monitor_only=bool(enabled);self.result=None;self.reset=True;self.generation+=1
     def submit(self,frame):
         with self.lock:
             if not self.enabled:return
@@ -94,8 +100,9 @@ class GestureWorker(threading.Thread):
                     with self.lock:
                         frame,self.frame=self.frame,None;generation=self.generation
                         reset,self.reset=self.reset,False
+                        monitor_only=self.monitor_only
                     if frame is None or not self.enabled:continue
-                    started=time.monotonic();result=process.infer(frame,reset)
+                    started=time.monotonic();result=process.infer(frame,reset,monitor_only)
                     if result is not None:
                         result['points']=np.asarray(result['points'],np.float32)
                         result['box']=np.asarray(result['box'],np.float32)

@@ -27,7 +27,7 @@ def main():
         command=json.loads(line)
         if command.get('reset'):
             detector.tracked=None;candidate='';since=0.;numbers.reset()
-        started=time.monotonic();result=detector.detect(frame)
+        started=time.monotonic();result=detector.detect(frame,stop_only=bool(command.get('monitor_only')))
         if result is not None:
             result['number']=numbers.update(result.get('number'),started)
             name=result['label']

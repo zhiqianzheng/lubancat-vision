@@ -72,6 +72,14 @@ def classify(points):
     return describe_hand(points)['label']
 
 
+def stop_pair(first,second):
+    if first is None or second is None:return False
+    if first.get('number')!=5 or second.get('number')!=5:return False
+    a,b=first['points'],second['points']
+    span=max(float(np.linalg.norm(p[5,:2]-p[17,:2])) for p in (a,b))
+    return float(np.linalg.norm(a[0,:2]-b[0,:2]))>max(20.,span*1.2)
+
+
 class GestureDetector:
     def __init__(self):
         from gesture_handpose import MPHandPose
@@ -86,6 +94,7 @@ class GestureDetector:
         self.anchors=np.asarray(anchors,np.float32)
         self.tracked=None
         self.last_search=0.
+        self.last_stop_search=0.
 
     def palms(self,bgr):
         h,w=bgr.shape[:2];gain=192./max(h,w)
@@ -117,23 +126,39 @@ class GestureDetector:
             if skip:continue
             points=(boxes[i,4:].reshape(7,2)/192.+self.anchors[i])*max(h,w)-[left/gain,top/gain]
             found.append(np.r_[box,points.reshape(-1),scores[i]])
-        return found[:1]
+        return found[:2]
 
-    def detect(self,frame):
-        bgr=cv2.cvtColor(frame,cv2.COLOR_BGRA2BGR)
-        now=time.monotonic()
-        palms=[self.tracked] if self.tracked is not None and now-self.last_search<1.5 else self.palms(bgr)
-        if self.tracked is None or now-self.last_search>=1.5:self.last_search=now
-        if not palms:
-            self.tracked=None;return None
-        result=self.hand.infer(bgr,palms[0])
-        if result is None:
-            self.tracked=None;return None
+    def hand_result(self,bgr,palm):
+        result=self.hand.infer(bgr,palm)
+        if result is None:return None
         points=result[4:67].reshape(21,3)
         palm_points=points[[0,5,9,13,17,1,2],:2]
         lo,hi=palm_points.min(axis=0),palm_points.max(axis=0)
-        if np.min(hi-lo)<8 or not np.isfinite(points).all():
-            self.tracked=None;return None
-        self.tracked=np.r_[lo,hi,palm_points.reshape(-1),result[-1]]
+        if np.min(hi-lo)<8 or not np.isfinite(points).all():return None
         return dict(describe_hand(points),points=points.copy(),box=result[:4].copy(),
-                    confidence=float(result[-1]))
+                    confidence=float(result[-1]),palm=np.r_[lo,hi,palm_points.reshape(-1),result[-1]])
+
+    def detect(self,frame,stop_only=False):
+        bgr=cv2.cvtColor(frame,cv2.COLOR_BGRA2BGR)
+        now=time.monotonic()
+        search=stop_only or self.tracked is None or now-self.last_search>=1.5
+        palms=self.palms(bgr) if search else [self.tracked]
+        if search:self.last_search=now
+        if stop_only and len(palms)<2:return None
+        if not palms:
+            self.tracked=None;return None
+        result=self.hand_result(bgr,palms[0])
+        if result is None:
+            self.tracked=None;return None
+        self.tracked=result.pop('palm')
+        result['stop']=False;result['stop_checked']=result['number']!=5
+        if result['number']==5 and (stop_only or now-self.last_stop_search>=.5):
+            self.last_stop_search=now;result['stop_checked']=True
+            candidates=palms if search else self.palms(bgr)
+            primary=result['points'][[0,5,9,13,17],:2].mean(axis=0)
+            for palm in candidates:
+                center=palm[4:18].reshape(7,2)[:5].mean(axis=0)
+                if float(np.linalg.norm(center-primary))<max(20.,float(np.linalg.norm(result['points'][5,:2]-result['points'][17,:2]))):continue
+                other=self.hand_result(bgr,palm)
+                if stop_pair(result,other):result['stop']=True;break
+        return result
