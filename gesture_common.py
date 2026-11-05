@@ -3,6 +3,38 @@ HAND_CONNECTIONS = [(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
                     (13,17),(0,17),(17,18),(18,19),(19,20)]
 
 
+class NumberOkSequence:
+    """Select a stable digit, then confirm it with a separate stable OK pose."""
+    def __init__(self, timeout=5.):self.timeout=timeout;self.reset()
+    def reset(self):
+        self.selected=None;self.deadline=0.;self.last_sample=None;self.last_seen=None
+        self.candidate=None;self.since=0.;self.samples=0
+    def update(self, result, now, enabled=True):
+        if not enabled:self.reset();return None
+        if self.selected is not None and now>self.deadline:self.reset()
+        if result is None:
+            self.candidate=None;self.samples=0;return None
+        sample=result.get('sample_id')
+        if sample is None or sample==self.last_sample:return None
+        if self.last_seen is not None and now-self.last_seen>1.:
+            self.candidate=None;self.samples=0
+        self.last_seen=now
+        self.last_sample=sample
+        number=result.get('number')
+        pose=number if number in (1,2,3,4,5) else 'OK' if result.get('label')=='OK' else None
+        if pose is None:self.candidate=None;self.samples=0;return None
+        if pose!=self.candidate:
+            self.candidate=pose;self.since=now;self.samples=0
+        self.samples+=1
+        if self.samples<2 or now-self.since<.25:return None
+        if pose=='OK':
+            selected=self.selected
+            self.reset()
+            return selected
+        self.selected=pose;self.deadline=now+self.timeout
+        return None
+
+
 class StableHandNumber:
     """Require consecutive model samples; never carry a digit across hand loss."""
     def __init__(self):self.reset()

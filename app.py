@@ -19,7 +19,7 @@ gi.require_version('Gst', '1.0')
 gi.require_version('PangoCairo', '1.0')
 from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gst, Pango, PangoCairo
 from gesture_client import GestureWorker, HAND_CONNECTIONS
-from gesture_common import FullscreenGestureSequence, CoveredLensReset
+from gesture_common import FullscreenGestureSequence, CoveredLensReset, NumberOkSequence
 from visual_demo import VisualDemo
 from hand_motion import HandMotionWorker
 import cv2
@@ -307,6 +307,9 @@ class App(Gtk.Window):
         self.preview_fullscreen = False
         self.gesture_sequence = FullscreenGestureSequence()
         self.cover_reset = CoveredLensReset()
+        self.mode_sequence = NumberOkSequence()
+        self.gesture_modes = {1:('paint','隔空画画'),2:('particles','掌心粒子'),
+                              3:('pinch','捏合缩放'),4:('bricks','隔空打砖块'),5:('scanner','物体扫描仪')}
         self.demo = VisualDemo()
         self.scan_sequence = 0
         self.normal_fill = None
@@ -659,6 +662,7 @@ class App(Gtk.Window):
         return False
 
     def paint(self):
+        self.apply_gesture_mode()
         self.apply_gesture_fullscreen()
         if self.demo.mode == 'body':
             result, enabled, error = self.camera.body.snapshot()
@@ -792,6 +796,7 @@ class App(Gtk.Window):
             self.normal_hand = self.gesture_toggle.get_active()
             self.fill_preview.set_active(False)
         self.demo.set_mode(mode)
+        self.mode_sequence.reset()
         self.gesture_sequence.reset()
         self.gesture_notice = ''
         labels = {'paint':'清空画布','pinch':'复位卡片','bricks':'重开游戏','body':'重开/校准','scanner':'重新取景'}
@@ -826,6 +831,14 @@ class App(Gtk.Window):
             self.message('识别卡片已保存',str(path))
         except Exception as exc:self.message('保存失败',str(exc))
 
+    def apply_gesture_mode(self):
+        result, enabled, error = self.camera.gestures.snapshot()
+        number = self.mode_sequence.update(result, time.monotonic(),
+            not self.demo.active and enabled and not error and not self.cover_reset.latched)
+        if number is not None:
+            self.demo_selector.set_active_id(self.gesture_modes[number][0])
+            self.demo_enable.set_active(True)
+
     def apply_gesture_fullscreen(self):
         if self.demo.active:
             return
@@ -856,6 +869,9 @@ class App(Gtk.Window):
             text = '手势识别已关闭'
         elif not self.camera.gestures.loaded:
             text = '手势：正在加载模型…'
+        elif self.mode_sequence.selected is not None:
+            number = self.mode_sequence.selected
+            text = '数字 {}：{} · 请在 5 秒内做 OK 开启'.format(number,self.gesture_modes[number][1])
         elif self.gesture_notice and time.monotonic() < self.gesture_notice_until:
             text = '手势控制：' + self.gesture_notice
         elif result is not None and result.get('number') is not None:
