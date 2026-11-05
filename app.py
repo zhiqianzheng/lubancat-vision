@@ -19,6 +19,9 @@ gi.require_version('Gst', '1.0')
 gi.require_version('PangoCairo', '1.0')
 from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gst, Pango, PangoCairo
 from gesture_client import GestureWorker, HAND_CONNECTIONS
+from gesture_common import FullscreenGestureSequence, CoveredLensReset, NumberOkSequence, DoublePalmStop
+from visual_demo import VisualDemo
+from hand_motion import HandMotionWorker
 import cv2
 import numpy as np
 import cairo
@@ -69,15 +72,21 @@ class DetectionWorker(threading.Thread):
         self.lock, self.ready, self.stopping = threading.Lock(), threading.Event(), threading.Event()
         self.frame, self.results, self.generated = None, [], 0.
         self.processed_frames, self.inference_seconds = 0, 0.
+        self.request_id = self.completed_request = None
 
-    def submit(self, frame):
+    def submit(self, frame, request_id=None):
         with self.lock:
             self.frame = frame
+            self.request_id = request_id
         self.ready.set()
 
     def snapshot(self):
         with self.lock:
             return list(self.results) if time.monotonic()-self.generated < 1.5 else []
+
+    def scan_snapshot(self, request_id):
+        with self.lock:
+            return list(self.results) if self.completed_request == request_id else None
 
     def statistics(self):
         with self.lock:
@@ -96,6 +105,7 @@ class DetectionWorker(threading.Thread):
                 self.ready.clear()
                 with self.lock:
                     frame, self.frame = self.frame, None
+                    request_id = self.request_id
                 if frame is None:
                     continue
                 started = time.monotonic()
@@ -103,6 +113,7 @@ class DetectionWorker(threading.Thread):
                 elapsed = time.monotonic()-started
                 with self.lock:
                     self.results, self.generated = results, time.monotonic()
+                    self.completed_request = request_id
                     self.processed_frames += 1
                     self.inference_seconds = elapsed
                 next_run = started + .12
@@ -195,6 +206,8 @@ class Camera(threading.Thread):
         self.objects = DetectionWorker(app)
         self.scans = ScanWorker(app)
         self.gestures = GestureWorker()
+        self.motion = HandMotionWorker(self.gestures)
+        self.body = GestureWorker(engine='body_engine.py',enabled=False,interval=.3,idle=.5,ttl=1.)
 
     def run(self):
         pipe = None
@@ -203,6 +216,8 @@ class Camera(threading.Thread):
             self.objects.start()
             self.scans.start()
             self.gestures.start()
+            self.motion.start()
+            self.body.start()
             pipe = Gst.parse_launch('v4l2src device=' + DEVICE + ' io-mode=mmap ! '
                 'video/x-raw,format=NV12,width=640,height=480 ! '
                 'videorate drop-only=true ! video/x-raw,framerate=30/1 ! '
@@ -236,9 +251,14 @@ class Camera(threading.Thread):
                 frame.flags.writeable = False
                 with self.frame_lock:
                     self.latest = frame
-                self.objects.submit(frame)
-                self.scans.submit(frame)
+                if not self.app.demo.active:
+                    self.objects.submit(frame)
+                    self.scans.submit(frame)
+                if self.app.demo.mode == 'body':
+                    self.body.submit(frame)
                 self.gestures.submit(frame)
+                if self.app.demo.mode == 'pinch':
+                    self.motion.submit(frame)
                 frames += 1
                 if tick - last_report >= 1:
                     self.capture_fps = frames/(tick-last_report)
@@ -251,12 +271,18 @@ class Camera(threading.Thread):
             self.objects.stopping.set()
             self.scans.stopping.set()
             self.gestures.stopping.set()
+            self.motion.stopping.set()
+            self.body.stopping.set()
             if self.objects.is_alive():
                 self.objects.join(timeout=3)
             if self.scans.is_alive():
                 self.scans.join(timeout=3)
             if self.gestures.is_alive():
                 self.gestures.join(timeout=3)
+            if self.motion.is_alive():
+                self.motion.join(timeout=3)
+            if self.body.is_alive():
+                self.body.join(timeout=3)
 
 
 class App(Gtk.Window):
@@ -278,6 +304,18 @@ class App(Gtk.Window):
         self.label_font = Pango.FontDescription('Noto Sans CJK SC 10')
         self.gesture_font = Pango.FontDescription('Noto Sans CJK SC Bold 18')
         self.preview_fullscreen = False
+        self.gesture_sequence = FullscreenGestureSequence()
+        self.cover_reset = CoveredLensReset()
+        self.mode_sequence = NumberOkSequence()
+        self.stop_sequence = DoublePalmStop()
+        self.gesture_modes = {1:('paint','隔空画画'),2:('particles','掌心粒子'),
+                              3:('pinch','捏合缩放'),4:('bricks','隔空打砖块'),5:('scanner','物体扫描仪')}
+        self.demo = VisualDemo()
+        self.scan_sequence = 0
+        self.normal_fill = None
+        self.normal_hand = None
+        self.gesture_notice = ''
+        self.gesture_notice_until = 0.
         self.connect('destroy', self.quit)
         self.connect('key-press-event', self.preview_key)
         provider = Gtk.CssProvider()
@@ -314,9 +352,32 @@ class App(Gtk.Window):
         controls.pack_start(self.video_stats, False, False, 0)
         self.gesture_toggle = Gtk.ToggleButton(label='手势识别')
         self.gesture_toggle.set_active(True)
-        self.gesture_toggle.set_tooltip_text('支持张开手掌、握拳、比耶、点赞和食指向上；请正对摄像头并保持片刻。')
-        self.gesture_toggle.connect('toggled', lambda button: self.camera.gestures.set_enabled(button.get_active()))
+        self.gesture_toggle.set_tooltip_text('握拳→张开手掌进入全屏；张开手掌→握拳退出全屏。双手张掌保持约两秒退出程序；关闭普通手势后 STOP 仍可用。')
+        self.gesture_toggle.connect('toggled', lambda *_: self.configure_interaction_workers())
         controls.pack_start(self.gesture_toggle, False, False, 0)
+        self.demo_enable = Gtk.ToggleButton(label='互动：关')
+        self.demo_enable.set_tooltip_text('先选玩法再开启；关闭后停止对应互动模型和游戏。')
+        self.demo_enable.connect('toggled', self.change_demo_mode)
+        controls.pack_start(self.demo_enable, False, False, 0)
+        self.demo_selector = Gtk.ComboBoxText()
+        for key, title in [('paint', '隔空画画'), ('particles', '掌心粒子'), ('pinch', '捏合缩放'), ('bricks', '隔空打砖块'), ('scanner', '物体扫描仪'), ('body', '人体动作游戏')]:
+            self.demo_selector.append(key, title)
+        self.demo_selector.set_active_id('bricks')
+        self.demo_selector.set_tooltip_text('演示模式暂停物体检测、扫码及手势全屏切换；切回普通模式恢复。F11、Esc 仍可用。')
+        self.demo_selector.connect('changed', self.change_demo_mode)
+        controls.pack_start(self.demo_selector, False, False, 0)
+        self.clear_drawing = Gtk.Button(label='清空画布')
+        self.clear_drawing.set_no_show_all(True)
+        self.clear_drawing.connect('clicked', lambda *_: self.demo.reset_current())
+        controls.pack_start(self.clear_drawing, False, False, 0)
+        self.scan_button = Gtk.Button(label='扫描（空格）')
+        self.scan_button.set_no_show_all(True)
+        self.scan_button.connect('clicked', self.start_object_scan)
+        controls.pack_start(self.scan_button, False, False, 0)
+        self.save_scan_button = Gtk.Button(label='保存卡片')
+        self.save_scan_button.set_no_show_all(True)
+        self.save_scan_button.connect('clicked', self.save_scan_card)
+        controls.pack_start(self.save_scan_button, False, False, 0)
         self.fill_preview = Gtk.ToggleButton(label='铺满屏幕')
         self.fill_preview.set_tooltip_text('保持比例铺满屏幕，可能裁切画面边缘；关闭后显示完整画面。')
         self.fill_preview.connect('toggled', lambda *_: self.canvas.queue_draw())
@@ -382,6 +443,7 @@ class App(Gtk.Window):
         self.preview_panels = [top, side, tabs, self.footer]
         self.refresh()
         self.camera = Camera(self)
+        self.configure_interaction_workers()
         self.camera.start()
         GLib.timeout_add(15, self.paint)
         GLib.timeout_add_seconds(1, self.tick)
@@ -412,6 +474,9 @@ class App(Gtk.Window):
         return False
 
     def preview_key(self, _widget, event):
+        if event.keyval == Gdk.KEY_space and self.demo.mode == 'scanner':
+            self.start_object_scan()
+            return True
         if event.keyval == Gdk.KEY_F11:
             self.set_preview_fullscreen(not self.preview_fullscreen)
             return True
@@ -597,13 +662,43 @@ class App(Gtk.Window):
         return False
 
     def paint(self):
+        stop, _, _ = self.camera.gestures.snapshot()
+        if self.stop_sequence.update(stop,time.monotonic()):
+            self.destroy()
+            return False
+        self.apply_gesture_mode()
+        self.apply_gesture_fullscreen()
+        if self.demo.mode == 'body':
+            result, enabled, error = self.camera.body.snapshot()
+        elif self.demo.mode == 'scanner':
+            result, enabled, error = None, True, ''
+        else:
+            result, enabled, error = self.hand_snapshot()
+        if self.demo.mode == 'pinch':
+            tracked = self.camera.motion.snapshot()
+            if tracked is not None:result = tracked
+        animated = self.demo.update(result, enabled, error, time.monotonic())
+        if self.demo.mode == 'scanner':
+            scene = self.demo.scene
+            if scene.request_id is not None and scene.results is None:
+                results = self.camera.objects.scan_snapshot(scene.request_id)
+                if results is not None:scene.accept(results, lambda cls: LABELS[cls])
+            can_scan = scene.request_id is None or scene.results is not None or bool(scene.error)
+            if self.scan_button.get_sensitive() != can_scan:self.scan_button.set_sensitive(can_scan)
+            can_save = scene.best is not None
+            if self.save_scan_button.get_sensitive() != can_save:self.save_scan_button.set_sensitive(can_save)
         with self.camera.frame_lock:
             frame, self.camera.latest = self.camera.latest, None
         if frame is not None:
+            if self.cover_reset.update(frame, time.monotonic(), self.demo.active):
+                self.demo_enable.set_active(False)
+                self.gesture_notice = '已复位到 YOLO 物体检测'
+                self.gesture_notice_until = time.monotonic()+3.
             np.copyto(self.video_pixels, frame)
             self.video_surface.mark_dirty()
             self.has_frame = True
             self.video_sequence += 1
+        if frame is not None or animated:
             self.canvas.queue_draw()
         return True
 
@@ -619,39 +714,40 @@ class App(Gtk.Window):
             scale = (max if self.preview_fullscreen and self.fill_preview.get_active() else min)(w/640., h/480.)
             cr.translate((w-640*scale)/2., (h-480*scale)/2.)
             cr.scale(scale, scale)
-            cr.set_source_surface(self.video_surface, 0, 0)
+            cr.set_source_surface(self.demo.background(self.video_surface), 0, 0)
             cr.get_source().set_filter(cairo.FILTER_BILINEAR)
             cr.paint()
-            cr.set_source_rgb(.29, .88, .73)
-            cr.set_line_width(2)
-            for x1, y1, x2, y2 in self.camera.scans.snapshot():
-                cr.rectangle(x1, y1, x2-x1, y2-y1)
-                cr.stroke()
-            colors = [(.32,.9,.69), (.35,.78,1.), (1.,.77,.32), (.9,.55,1.), (1.,.55,.48)]
-            for cls, score, x1, y1, x2, y2 in self.camera.objects.snapshot():
-                color = colors[cls % len(colors)]
-                cr.set_source_rgb(*color)
+            if not self.demo.active:
+                cr.set_source_rgb(.29, .88, .73)
                 cr.set_line_width(2)
-                cr.rectangle(x1, y1, x2-x1, y2-y1)
-                cr.stroke()
-                text = '{} {:.0f}%'.format(LABELS[cls], score*100)
-                layout = self.text_layouts.get(text)
-                if layout is None:
-                    if len(self.text_layouts) >= 128:
-                        self.text_layouts.clear()
-                    layout = PangoCairo.create_layout(cr)
-                    layout.set_font_description(self.label_font)
-                    layout.set_text(text, -1)
-                    self.text_layouts[text] = layout
-                tw, th = layout.get_pixel_size()
-                tx, ty = min(x1, 640-tw-8), max(0, y1-th-6)
-                cr.rectangle(tx, ty, tw+8, th+6)
-                cr.fill()
-                cr.set_source_rgb(.025,.055,.075)
-                cr.move_to(tx+4, ty+3)
-                PangoCairo.show_layout(cr, layout)
-            gesture, enabled, error = self.camera.gestures.snapshot()
-            if gesture is not None:
+                for x1, y1, x2, y2 in self.camera.scans.snapshot():
+                    cr.rectangle(x1, y1, x2-x1, y2-y1)
+                    cr.stroke()
+                colors = [(.32,.9,.69), (.35,.78,1.), (1.,.77,.32), (.9,.55,1.), (1.,.55,.48)]
+                for cls, score, x1, y1, x2, y2 in self.camera.objects.snapshot():
+                    color = colors[cls % len(colors)]
+                    cr.set_source_rgb(*color)
+                    cr.set_line_width(2)
+                    cr.rectangle(x1, y1, x2-x1, y2-y1)
+                    cr.stroke()
+                    text = '{} {:.0f}%'.format(LABELS[cls], score*100)
+                    layout = self.text_layouts.get(text)
+                    if layout is None:
+                        if len(self.text_layouts) >= 128:
+                            self.text_layouts.clear()
+                        layout = PangoCairo.create_layout(cr)
+                        layout.set_font_description(self.label_font)
+                        layout.set_text(text, -1)
+                        self.text_layouts[text] = layout
+                    tw, th = layout.get_pixel_size()
+                    tx, ty = min(x1, 640-tw-8), max(0, y1-th-6)
+                    cr.rectangle(tx, ty, tw+8, th+6)
+                    cr.fill()
+                    cr.set_source_rgb(.025,.055,.075)
+                    cr.move_to(tx+4, ty+3)
+                    PangoCairo.show_layout(cr, layout)
+            gesture, enabled, error = self.hand_snapshot()
+            if gesture is not None and not self.demo.active:
                 points = gesture['points']
                 cr.set_source_rgb(1., .82, .2)
                 cr.set_line_width(2)
@@ -665,6 +761,8 @@ class App(Gtk.Window):
                 x1, y1, x2, y2 = gesture['box']
                 cr.rectangle(float(x1), float(y1), float(x2-x1), float(y2-y1))
                 cr.stroke()
+            if self.demo.active:
+                self.demo.draw(cr, time.monotonic(), self.video_surface)
         cr.restore()
         text = self.gesture_status_text()
         key = 'gesture:' + text
@@ -686,14 +784,115 @@ class App(Gtk.Window):
         PangoCairo.show_layout(cr, layout)
         return False
 
-    def gesture_status_text(self):
+    def configure_interaction_workers(self):
+        if not hasattr(self, 'camera'):return
+        hand = self.demo.mode in ('normal','paint','particles','pinch','bricks')
+        self.gesture_toggle.set_sensitive(hand)
+        monitor = not (hand and self.gesture_toggle.get_active())
+        self.camera.gestures.set_enabled(True)
+        self.camera.gestures.set_monitor_only(monitor)
+        self.camera.gestures.interval = .5 if monitor else .3
+        self.camera.gestures.idle = .5 if monitor else .3 if self.demo.mode == 'paint' else 1.
+        self.camera.body.set_enabled(self.demo.mode == 'body')
+        self.camera.motion.set_enabled(self.demo.mode == 'pinch' and self.gesture_toggle.get_active())
+
+    def change_demo_mode(self, _widget):
+        mode = self.demo_selector.get_active_id() if self.demo_enable.get_active() else 'normal'
+        self.demo_enable.set_label('互动：开' if self.demo_enable.get_active() else '互动：关')
+        if not self.demo.active and mode != 'normal':
+            self.normal_fill = self.fill_preview.get_active()
+            self.normal_hand = self.gesture_toggle.get_active()
+            self.fill_preview.set_active(False)
+        self.demo.set_mode(mode)
+        self.mode_sequence.reset()
+        self.gesture_sequence.reset()
+        self.gesture_notice = ''
+        labels = {'paint':'清空画布','pinch':'复位卡片','bricks':'重开游戏','body':'重开/校准','scanner':'重新取景'}
+        self.clear_drawing.set_visible(mode in labels)
+        if mode in labels:self.clear_drawing.set_label(labels[mode])
+        self.scan_button.set_visible(mode == 'scanner')
+        self.save_scan_button.set_visible(mode == 'scanner')
+        if mode in ('paint','particles','pinch','bricks'):
+            self.gesture_toggle.set_active(True)
+        if mode == 'normal' and self.normal_fill is not None:
+            self.fill_preview.set_active(self.normal_fill)
+            self.gesture_toggle.set_active(self.normal_hand)
+            self.normal_fill = self.normal_hand = None
+        self.configure_interaction_workers()
+        self.canvas.queue_draw()
+
+    def start_object_scan(self, *_):
+        if self.demo.mode != 'scanner' or not self.has_frame:return
+        scene = self.demo.scene
+        if scene.request_id is not None and scene.results is None and not scene.error:return
+        self.scan_sequence += 1
+        scene.start(self.video_pixels, self.scan_sequence, time.monotonic())
+        self.camera.objects.submit(scene.frame, request_id=self.scan_sequence)
+
+    def save_scan_card(self, *_):
+        if self.demo.mode != 'scanner' or self.demo.scene.best is None:return
+        directory = DATA / 'scans'
+        try:
+            directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+            path = directory / ('scan-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.png')
+            self.demo.scene.save(path)
+            self.message('识别卡片已保存',str(path))
+        except Exception as exc:self.message('保存失败',str(exc))
+
+    def hand_snapshot(self):
         result, enabled, error = self.camera.gestures.snapshot()
+        enabled = enabled and self.gesture_toggle.get_active()
+        return result if enabled else None, enabled, error
+
+    def apply_gesture_mode(self):
+        result, enabled, error = self.hand_snapshot()
+        number = self.mode_sequence.update(result, time.monotonic(),
+            not self.demo.active and enabled and not error and not self.cover_reset.latched)
+        if number is not None:
+            self.demo_selector.set_active_id(self.gesture_modes[number][0])
+            self.demo_enable.set_active(True)
+
+    def apply_gesture_fullscreen(self):
+        if self.demo.active:
+            return
+        result, enabled, error = self.hand_snapshot()
+        now = time.monotonic()
+        action = self.gesture_sequence.update(
+            result['label'] if result else '',
+            result.get('sample_id') if result else None,
+            now, enabled and not error)
+        if not enabled or error:
+            self.gesture_notice = ''
+        if action is not None:
+            if self.preview_fullscreen != action:
+                self.set_preview_fullscreen(action)
+            self.gesture_notice = '已进入全屏' if action else '已退出全屏'
+            self.gesture_notice_until = now + 1.8
+
+    def gesture_status_text(self):
+        if self.stop_sequence.since is not None:
+            remaining=max(0.,self.stop_sequence.hold-(time.monotonic()-self.stop_sequence.since))
+            return '双手 STOP：保持 {:.1f} 秒退出程序 · 放下手取消'.format(remaining)
+        if self.demo.active:
+            worker = self.camera.body if self.demo.mode == 'body' else self.camera.gestures
+            if self.demo.mode != 'scanner' and worker.enabled and not worker.loaded:
+                return '正在加载人体模型…' if self.demo.mode == 'body' else '正在加载手部模型…'
+            return self.demo.status_text(time.monotonic())
+        result, enabled, error = self.hand_snapshot()
         if error:
             text = '手势识别不可用：' + error[:100]
         elif not enabled:
-            text = '手势识别已关闭'
+            text = '手势识别已关闭 · 双手 STOP 仍可退出'
         elif not self.camera.gestures.loaded:
             text = '手势：正在加载模型…'
+        elif self.mode_sequence.selected is not None:
+            number = self.mode_sequence.selected
+            text = '数字 {}：{} · 请在 5 秒内做 OK 开启'.format(number,self.gesture_modes[number][1])
+        elif self.gesture_notice and time.monotonic() < self.gesture_notice_until:
+            text = '手势控制：' + self.gesture_notice
+        elif result is not None and result.get('number') is not None:
+            text = '手势：数字 {}'.format(result['number'])
+            if result['label']:text += ' · ' + result['label']
         elif result is not None and result['label']:
             text = '手势：' + result['label']
         elif result is not None:
@@ -711,9 +910,16 @@ class App(Gtk.Window):
         self.previous_inference_frames = inference_frames
         self.rendered_frames, self.inference_frames, self.stats_tick = 0, 0, stamp
         if not self.preview_fullscreen:
-            self.camera_info(self.camera.capture_fps, len(self.camera.scans.snapshot()))
-            self.object_info(results, inference_seconds)
-        self.video_stats.set_text('画面 {:.0f} FPS · 检测 {:.0f} FPS'.format(self.render_fps, self.inference_fps))
+            if self.demo.active:
+                self.camera_label.set_text('摄像头在线 · {:.0f} FPS'.format(self.camera.capture_fps))
+                self.object_label.set_text('演示中：物体检测与扫码已暂停，\n切回普通模式后恢复。')
+            else:
+                self.camera_info(self.camera.capture_fps, len(self.camera.scans.snapshot()))
+                self.object_info(results, inference_seconds)
+        if self.demo.active:
+            self.video_stats.set_text('画面 {:.0f} FPS · 演示模式'.format(self.render_fps))
+        else:
+            self.video_stats.set_text('画面 {:.0f} FPS · 检测 {:.0f} FPS'.format(self.render_fps, self.inference_fps))
         self.clock.set_text(datetime.now().astimezone().strftime('%Y-%m-%d  %H:%M:%S %Z'))
         if self.result_until and time.monotonic() > self.result_until:
             self.set_result('等待扫码', '请将个人二维码对准摄像头。', None)
