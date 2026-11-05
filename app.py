@@ -19,7 +19,7 @@ gi.require_version('Gst', '1.0')
 gi.require_version('PangoCairo', '1.0')
 from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gst, Pango, PangoCairo
 from gesture_client import GestureWorker, HAND_CONNECTIONS
-from gesture_common import FullscreenGestureSequence
+from gesture_common import FullscreenGestureSequence, CoveredLensReset
 from visual_demo import VisualDemo
 from hand_motion import HandMotionWorker
 import cv2
@@ -306,6 +306,7 @@ class App(Gtk.Window):
         self.gesture_font = Pango.FontDescription('Noto Sans CJK SC Bold 18')
         self.preview_fullscreen = False
         self.gesture_sequence = FullscreenGestureSequence()
+        self.cover_reset = CoveredLensReset()
         self.demo = VisualDemo()
         self.scan_sequence = 0
         self.normal_fill = None
@@ -681,6 +682,10 @@ class App(Gtk.Window):
         with self.camera.frame_lock:
             frame, self.camera.latest = self.camera.latest, None
         if frame is not None:
+            if self.cover_reset.update(frame, time.monotonic(), self.demo.active):
+                self.demo_enable.set_active(False)
+                self.gesture_notice = '已复位到 YOLO 物体检测'
+                self.gesture_notice_until = time.monotonic()+3.
             np.copyto(self.video_pixels, frame)
             self.video_surface.mark_dirty()
             self.has_frame = True
