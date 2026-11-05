@@ -101,7 +101,10 @@ class GestureWorker(threading.Thread):
                         result['box']=np.asarray(result['box'],np.float32)
                     with self.lock:
                         self.processed_frames+=1
-                        if result is not None:result['sample_id']=self.processed_frames
+                        if result is not None:
+                            result['sample_id']=self.processed_frames
+                            if self.engine=='gesture_engine.py':
+                                result['source_frame']=frame;result['source_time']=started
                         if self.enabled and generation==self.generation:
                             self.result=result;self.generated=time.monotonic()
                         self.elapsed=time.monotonic()-started

@@ -21,6 +21,7 @@ from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gst, Pango, PangoCairo
 from gesture_client import GestureWorker, HAND_CONNECTIONS
 from gesture_common import FullscreenGestureSequence
 from visual_demo import VisualDemo
+from hand_motion import HandMotionWorker
 import cv2
 import numpy as np
 import cairo
@@ -205,6 +206,7 @@ class Camera(threading.Thread):
         self.objects = DetectionWorker(app)
         self.scans = ScanWorker(app)
         self.gestures = GestureWorker()
+        self.motion = HandMotionWorker(self.gestures)
         self.body = GestureWorker(engine='body_engine.py',enabled=False,interval=.3,idle=.5,ttl=1.)
 
     def run(self):
@@ -214,6 +216,7 @@ class Camera(threading.Thread):
             self.objects.start()
             self.scans.start()
             self.gestures.start()
+            self.motion.start()
             self.body.start()
             pipe = Gst.parse_launch('v4l2src device=' + DEVICE + ' io-mode=mmap ! '
                 'video/x-raw,format=NV12,width=640,height=480 ! '
@@ -255,6 +258,8 @@ class Camera(threading.Thread):
                     self.body.submit(frame)
                 elif self.app.demo.mode != 'scanner':
                     self.gestures.submit(frame)
+                if self.app.demo.mode == 'pinch':
+                    self.motion.submit(frame)
                 frames += 1
                 if tick - last_report >= 1:
                     self.capture_fps = frames/(tick-last_report)
@@ -267,6 +272,7 @@ class Camera(threading.Thread):
             self.objects.stopping.set()
             self.scans.stopping.set()
             self.gestures.stopping.set()
+            self.motion.stopping.set()
             self.body.stopping.set()
             if self.objects.is_alive():
                 self.objects.join(timeout=3)
@@ -274,6 +280,8 @@ class Camera(threading.Thread):
                 self.scans.join(timeout=3)
             if self.gestures.is_alive():
                 self.gestures.join(timeout=3)
+            if self.motion.is_alive():
+                self.motion.join(timeout=3)
             if self.body.is_alive():
                 self.body.join(timeout=3)
 
@@ -657,6 +665,9 @@ class App(Gtk.Window):
             result, enabled, error = None, True, ''
         else:
             result, enabled, error = self.camera.gestures.snapshot()
+        if self.demo.mode == 'pinch':
+            tracked = self.camera.motion.snapshot()
+            if tracked is not None:result = tracked
         animated = self.demo.update(result, enabled, error, time.monotonic())
         if self.demo.mode == 'scanner':
             scene = self.demo.scene
@@ -766,6 +777,7 @@ class App(Gtk.Window):
         self.gesture_toggle.set_sensitive(hand)
         self.camera.gestures.set_enabled(hand and self.gesture_toggle.get_active())
         self.camera.body.set_enabled(self.demo.mode == 'body')
+        self.camera.motion.set_enabled(self.demo.mode == 'pinch' and self.gesture_toggle.get_active())
 
     def change_demo_mode(self, _widget):
         mode = self.demo_selector.get_active_id() if self.demo_enable.get_active() else 'normal'

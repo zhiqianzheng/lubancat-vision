@@ -17,7 +17,11 @@ class LayerScene:
         if self.layer is None:self.layer=cairo.ImageSurface(cairo.FORMAT_ARGB32,320,240)
         c=cairo.Context(self.layer);c.set_operator(cairo.OPERATOR_CLEAR);c.paint();c.set_operator(cairo.OPERATOR_OVER);c.scale(.5,.5)
         self.render(c,now,video)
-        cr.save();cr.scale(2.,2.);cr.set_source_surface(self.layer,0,0);cr.paint();cr.restore()
+        cr.save()
+        bounds=self.paint_bounds() if hasattr(self,'paint_bounds') else None
+        if bounds is not None:
+            x,y,w,h=bounds;cr.rectangle(x,y,w,h);cr.clip()
+        cr.scale(2.,2.);cr.set_source_surface(self.layer,0,0);cr.paint();cr.restore()
     @staticmethod
     def text(cr,text,x,y,size=18,color=(.9,.96,1.)):
         cr.set_source_rgb(*color);cr.select_font_face('Sans');cr.set_font_size(size);cr.move_to(x,y);cr.show_text(str(text));cr.new_path()
@@ -30,28 +34,75 @@ class PinchScene(LayerScene):
     def __init__(self):super().__init__();self.reset()
     def reset(self):
         self.cx,self.cy,self.scale=320.,240.,1.;self.grab=False;self.zoom=None;self.sample=None
-        self.offset=(0.,0.);self.cursor=None;self.photo=None
+        self.tx,self.ty,self.target_scale=self.cx,self.cy,self.scale
+        self.offset=(0.,0.);self.cursor=None;self.photo=None;self.span=None
+        self.last_seen=None;self.release_since=None;self.zoom_seen=0.;self.input_time=float('-inf')
+    @staticmethod
+    def straight(p,a,b,c):
+        u=(float(p[a][0]-p[b][0]),float(p[a][1]-p[b][1]))
+        v=(float(p[c][0]-p[b][0]),float(p[c][1]-p[b][1]));den=math.hypot(*u)*math.hypot(*v)
+        return den>1e-6 and (u[0]*v[0]+u[1]*v[1])/den<-.72
+    def _zoom_pose(self,result):
+        p=result['points'];valid=result.get('valid_points',[True]*21)
+        if not(valid[8] and valid[12]):return False
+        if result['label']=='胜利手势':return True
+        return (self.straight(p,5,6,8) and self.straight(p,9,10,12)
+                and not self.straight(p,13,14,16) and not self.straight(p,17,18,20))
     def update(self,result,now):
-        self.step(now);self.tracking=result is not None
-        if result is None:self.grab=False;self.zoom=None;self.cursor=None;return True
-        if result.get('sample_id')==self.sample:return True
-        self.sample=result.get('sample_id');p=result['points'];label=result['label']
-        mid=((float(p[4][0])+float(p[8][0]))/2.,(float(p[4][1])+float(p[8][1]))/2.)
-        self.cursor=mid;span=max(distance(p[0],p[9]),distance(p[5],p[17]),15.)
-        ratio=distance(p[4],p[8])/span
-        inside=abs(mid[0]-self.cx)<120*self.scale and abs(mid[1]-self.cy)<90*self.scale
-        if label=='胜利手势':
-            spread=distance(p[8],p[12])/span
-            if self.zoom is None:self.zoom=(max(.15,spread),self.scale)
-            self.scale=clamp(self.zoom[1]*spread/self.zoom[0],.5,1.8);self.grab=False
-        else:
-            self.zoom=None
-            if not self.grab and ratio<.32 and inside:
-                self.grab=True;self.offset=(self.cx-mid[0],self.cy-mid[1])
-            elif self.grab and ratio>.5:self.grab=False
-            if self.grab:
-                self.cx=clamp(mid[0]+self.offset[0],80,560);self.cy=clamp(mid[1]+self.offset[1],130,350)
+        dt=self.step(now)
+        measurement=result.get('tracked_at',result.get('source_time',now)) if result is not None else now
+        if result is not None and measurement>=self.input_time and result.get('sample_id')!=self.sample:
+            elapsed=min(.3,max(.01,now-self.last_seen)) if self.last_seen is not None else .05
+            self.sample=result.get('sample_id');self.input_time=measurement
+            p=result['points'];valid=result.get('valid_points',[True]*21)
+            can_drag=valid[4] and valid[8]
+            can_zoom=self._zoom_pose(result)
+            if not(can_drag or can_zoom):result=None
+            else:
+                self.last_seen=now;self.tracking=True
+                mid=((float(p[4][0])+float(p[8][0]))/2.,(float(p[4][1])+float(p[8][1]))/2.)
+                span=max(distance(p[0],p[9]),distance(p[5],p[17]),15.)
+                a=1.-math.exp(-elapsed/.15);self.span=span if self.span is None else self.span+(span-self.span)*a
+                ratio=distance(p[4],p[8])/self.span if can_drag else 1.
+                if not can_drag:mid=((float(p[8][0])+float(p[12][0]))/2.,(float(p[8][1])+float(p[12][1]))/2.)
+                inside=abs(mid[0]-self.cx)<120*self.scale+32 and abs(mid[1]-self.cy)<90*self.scale+32
+                self.cursor=mid
+                if self.grab:
+                    if ratio>.78:
+                        if self.release_since is None:self.release_since=now
+                        if now-self.release_since>=.10:self.grab=False;self.release_since=None
+                    else:self.release_since=None
+                    if self.grab and can_drag:self.tx=mid[0]+self.offset[0];self.ty=mid[1]+self.offset[1]
+                elif ratio<.44 and inside:
+                    self.grab=True;self.zoom=None;self.release_since=None
+                    self.offset=(self.cx-mid[0],self.cy-mid[1]);self.tx,self.ty=self.cx,self.cy
+                if not self.grab:
+                    if can_zoom:
+                        spread=clamp(distance(p[8],p[12])/self.span,.12,2.5)
+                        if self.zoom is None:self.zoom=(spread,self.scale)
+                        desired=clamp(self.zoom[1]*spread/self.zoom[0],.5,1.8)
+                        if abs(math.log(desired/self.target_scale))>.018:self.target_scale=desired
+                        self.zoom_seen=now
+                    elif self.zoom is not None and now-self.zoom_seen>.3:self.zoom=None
+        if self.last_seen is None or now-self.last_seen>.45:
+            self.tracking=False;self.grab=False;self.zoom=None;self.cursor=None;self.release_since=None
+            self.tx,self.ty=self.cx,self.cy
+        # Smooth between fresh tracked samples, rather than stepping at model rate.
+        travel=math.hypot(self.tx-self.cx,self.ty-self.cy)
+        alpha=1.-math.exp(-dt/(.025 if travel>25 else .045))
+        self.cx+=(self.tx-self.cx)*alpha;self.cy+=(self.ty-self.cy)*alpha
+        self.scale=math.exp(math.log(self.scale)+(math.log(self.target_scale)-math.log(self.scale))*(1.-math.exp(-dt/.07)))
+        self.cx=clamp(self.cx,12+120*self.scale,628-120*self.scale)
+        self.cy=clamp(self.cy,32+90*self.scale,448-90*self.scale)
         return True
+    def paint_bounds(self):
+        half_w,half_h=120*self.scale,90*self.scale
+        xs=[self.cx-half_w-6,self.cx+half_w+12];ys=[self.cy-half_h-6,self.cy+half_h+12]
+        if self.cursor is not None:
+            xs.extend([self.cursor[0]-12,self.cursor[0]+12]);ys.extend([self.cursor[1]-12,self.cursor[1]+12])
+        x0,x1=clamp(min(xs),0,640),clamp(max(xs),0,640)
+        y0,y1=clamp(min(ys),0,480),clamp(max(ys),0,480)
+        return x0,y0,max(0.,x1-x0),max(0.,y1-y0)
     def render(self,c,now,video):
         if self.photo is None and video is not None:
             import cairo
@@ -62,11 +113,16 @@ class PinchScene(LayerScene):
         if self.photo is not None:
             c.translate(x,y);c.scale(w/640.,h/480.);c.set_source_surface(self.photo,0,0);c.paint()
         else:c.set_source_rgb(.12,.25,.5);c.paint()
-        c.restore();c.set_source_rgb(.2,1.,.8) if self.grab else c.set_source_rgb(.3,.75,1.)
-        c.set_line_width(3);c.rectangle(x,y,w,h);c.stroke();self.text(c,'PINCH / DRAG / ZOOM',x+8,y+24,14)
+        c.restore()
+        c.set_source_rgb(*((.2,1.,.65) if self.grab else (.8,.45,1.) if self.zoom is not None else (.3,.75,1.)))
+        c.set_line_width(3);c.rectangle(x,y,w,h);c.stroke();self.text(c,'DRAG' if self.grab else 'ZOOM' if self.zoom is not None else 'PINCH TO GRAB',x+8,y+24,14)
         if self.cursor:
-            c.set_source_rgb(1.,.85,.2);c.arc(*self.cursor,7,0,math.tau);c.stroke()
-    def status(self):return '捏合拖动卡片 · 比耶双指开合缩放 · 按复位重置'
+            c.set_source_rgb(.2,1.,.65) if self.grab else c.set_source_rgb(1.,.85,.2)
+            c.arc(*self.cursor,9 if self.grab else 7,0,math.tau);c.stroke()
+    def status(self):
+        if self.grab:return '已抓住：移动手拖动卡片 · 张开拇指食指松开'
+        if self.zoom is not None:return '缩放中：食指中指张大放大、靠拢缩小'
+        return '拇指食指捏合抓取 · 比耶开合缩放 · 绿色表示已抓住'
 
 class BrickGame(LayerScene):
     def __init__(self):super().__init__();self.reset()
