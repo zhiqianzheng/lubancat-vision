@@ -22,6 +22,7 @@ from gesture_client import GestureWorker, HAND_CONNECTIONS
 from gesture_common import FullscreenGestureSequence, CoveredLensReset, NumberOkSequence, DoublePalmStop
 from visual_demo import VisualDemo
 from hand_motion import HandMotionWorker
+from gpu_bridge import GpuBridge
 import cv2
 import numpy as np
 import cairo
@@ -295,6 +296,13 @@ class App(Gtk.Window):
         self.video_pixels = np.frombuffer(self.video_bytes, np.uint8).reshape(480, 640, 4)
         self.video_surface = cairo.ImageSurface.create_for_data(self.video_bytes, cairo.FORMAT_RGB24, 640, 480, 640*4)
         self.has_frame = False
+        # Pace preview only; capture and inference keep consuming their latest frames.
+        self.preview_interval = 1./24
+        self.preview_next = 0.
+        self.gpu_enabled = os.environ.get('LIMAN_GPU_PREVIEW','1')=='1'
+        self.gpu_fps = 20 if os.environ.get('LIMAN_GPU_FPS','30')=='20' else 30
+        self.gpu=None;self.gpu_active=False;self.gpu_started=0.;self.gpu_completed=0
+        self.gpu_overlay=False
         self.video_sequence, self.displayed_sequence = 0, -1
         self.rendered_frames, self.inference_frames = 0, 0
         self.render_fps, self.inference_fps = 0., 0.
@@ -338,6 +346,8 @@ class App(Gtk.Window):
         self.canvas = Gtk.DrawingArea()
         self.canvas.set_size_request(640, 440)
         self.canvas.connect('draw', self.draw)
+        self.canvas.connect('realize', self.start_gpu)
+        self.canvas.connect('unrealize', lambda *_: self.stop_gpu())
         self.canvas.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
         self.canvas.connect('button-press-event', self.preview_click)
         video = Gtk.Overlay()
@@ -445,7 +455,7 @@ class App(Gtk.Window):
         self.camera = Camera(self)
         self.configure_interaction_workers()
         self.camera.start()
-        GLib.timeout_add(15, self.paint)
+        GLib.timeout_add(8 if self.gpu_enabled else 15, self.paint)
         GLib.timeout_add_seconds(1, self.tick)
         self.show_all()
         self.maximize()
@@ -661,7 +671,59 @@ class App(Gtk.Window):
         self.object_label.set_text('物体检测不可用：' + error)
         return False
 
+    def start_gpu(self, _widget):
+        if not self.gpu_enabled or self.gpu is not None:return
+        try:
+            from gi.repository import GdkX11
+            self.gpu=GpuBridge(self.canvas.get_window().get_xid());self.gpu_started=time.monotonic()
+        except Exception as exc:
+            print('GPU preview unavailable, using standard preview: '+str(exc),file=sys.stderr)
+            self.stop_gpu()
+
+    def stop_gpu(self):
+        self.gpu_active=False;self.gpu_completed=0;self.preview_next=0.
+        if self.gpu is not None:
+            gpu,self.gpu=self.gpu,None
+            gpu.close()
+        self.canvas.set_double_buffered(True)
+        self.canvas.queue_draw()
+
+    def update_gpu(self,now):
+        if self.gpu is None:return
+        try:
+            if not self.gpu.poll():raise RuntimeError(self.gpu.error)
+            if not self.gpu.ready:
+                if now-self.gpu_started>10:raise RuntimeError('GPU startup timed out')
+                return
+            if not self.gpu_active:
+                # EGL owns the native window's double buffering in its private process.
+                self.canvas.set_double_buffered(False);self.gpu_active=True;self.preview_next=0.
+            self.rendered_frames+=self.gpu.completed-self.gpu_completed
+            self.gpu_completed=self.gpu.completed
+        except Exception as exc:
+            print('GPU preview stopped, using standard preview: '+str(exc),file=sys.stderr)
+            self.stop_gpu()
+
+    def draw_gpu_overlay(self,cr):
+        self.gpu_overlay=True
+        try:self.draw(self.canvas,cr)
+        finally:self.gpu_overlay=False
+
+    def gpu_overlay_key(self):
+        if self.demo.active:return None
+        gesture,enabled,error=self.hand_snapshot()
+        return (self.canvas.get_allocated_width(),self.canvas.get_allocated_height(),self.preview_fullscreen,
+            self.fill_preview.get_active(),tuple(tuple(item) for item in self.camera.objects.snapshot()),
+            tuple(tuple(face) for face in self.camera.scans.snapshot()),
+            gesture.get('sample_id') if gesture is not None else None,self.gesture_status_text())
+
     def paint(self):
+        now = time.monotonic()
+        self.update_gpu(now)
+        if now < self.preview_next:return True
+        if self.gpu_active:
+            self.preview_next += (int((now-self.preview_next)*self.gpu_fps)+1)/self.gpu_fps
+        else:self.preview_next = now+self.preview_interval
         stop, _, _ = self.camera.gestures.snapshot()
         if self.stop_sequence.update(stop,time.monotonic()):
             self.destroy()
@@ -699,24 +761,36 @@ class App(Gtk.Window):
             self.has_frame = True
             self.video_sequence += 1
         if frame is not None or animated:
-            self.canvas.queue_draw()
+            if self.gpu_active:
+                try:
+                    source=self.demo.background(self.video_surface);source.flush()
+                    self.gpu.submit(source.get_data(),self.canvas.get_allocated_width(),
+                        self.canvas.get_allocated_height(),self.preview_fullscreen and self.fill_preview.get_active(),
+                        self.draw_gpu_overlay,self.gpu_overlay_key())
+                except Exception as exc:
+                    print('GPU presentation failed, using standard preview: '+str(exc),file=sys.stderr)
+                    self.stop_gpu()
+            else:self.canvas.queue_draw()
         return True
 
     def draw(self, widget, cr):
+        if self.gpu_active and not self.gpu_overlay:return True
         cr.save()
-        cr.set_source_rgb(.035, .06, .1)
-        cr.paint()
+        if not self.gpu_overlay and (not self.has_frame or not (self.preview_fullscreen and self.fill_preview.get_active())):
+            cr.set_source_rgb(.035, .06, .1)
+            cr.paint()
         if self.has_frame:
-            if self.displayed_sequence != self.video_sequence:
+            if not self.gpu_overlay and self.displayed_sequence != self.video_sequence:
                 self.rendered_frames += 1
                 self.displayed_sequence = self.video_sequence
             w, h = widget.get_allocated_width(), widget.get_allocated_height()
             scale = (max if self.preview_fullscreen and self.fill_preview.get_active() else min)(w/640., h/480.)
             cr.translate((w-640*scale)/2., (h-480*scale)/2.)
             cr.scale(scale, scale)
-            cr.set_source_surface(self.demo.background(self.video_surface), 0, 0)
-            cr.get_source().set_filter(cairo.FILTER_BILINEAR)
-            cr.paint()
+            if not self.gpu_overlay:
+                cr.set_source_surface(self.demo.background(self.video_surface), 0, 0)
+                cr.get_source().set_filter(cairo.FILTER_BILINEAR)
+                cr.paint()
             if not self.demo.active:
                 cr.set_source_rgb(.29, .88, .73)
                 cr.set_line_width(2)
@@ -917,9 +991,9 @@ class App(Gtk.Window):
                 self.camera_info(self.camera.capture_fps, len(self.camera.scans.snapshot()))
                 self.object_info(results, inference_seconds)
         if self.demo.active:
-            self.video_stats.set_text('画面 {:.0f} FPS · 演示模式'.format(self.render_fps))
+            self.video_stats.set_text('{} {:.0f} FPS · 演示模式'.format('GPU' if self.gpu_active else '画面',self.render_fps))
         else:
-            self.video_stats.set_text('画面 {:.0f} FPS · 检测 {:.0f} FPS'.format(self.render_fps, self.inference_fps))
+            self.video_stats.set_text('{} {:.0f} FPS · 检测 {:.0f} FPS'.format('GPU' if self.gpu_active else '画面',self.render_fps, self.inference_fps))
         self.clock.set_text(datetime.now().astimezone().strftime('%Y-%m-%d  %H:%M:%S %Z'))
         if self.result_until and time.monotonic() > self.result_until:
             self.set_result('等待扫码', '请将个人二维码对准摄像头。', None)
@@ -927,6 +1001,7 @@ class App(Gtk.Window):
         return True
 
     def quit(self, *_):
+        self.stop_gpu()
         self.camera.stopping.set()
         self.camera.join(timeout=3)
         self.store.db.close()
