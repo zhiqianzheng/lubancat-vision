@@ -295,6 +295,9 @@ class App(Gtk.Window):
         self.video_pixels = np.frombuffer(self.video_bytes, np.uint8).reshape(480, 640, 4)
         self.video_surface = cairo.ImageSurface.create_for_data(self.video_bytes, cairo.FORMAT_RGB24, 640, 480, 640*4)
         self.has_frame = False
+        # Pace preview only; capture and inference keep consuming their latest frames.
+        self.preview_interval = 1./24
+        self.preview_next = 0.
         self.video_sequence, self.displayed_sequence = 0, -1
         self.rendered_frames, self.inference_frames = 0, 0
         self.render_fps, self.inference_fps = 0., 0.
@@ -662,6 +665,9 @@ class App(Gtk.Window):
         return False
 
     def paint(self):
+        now = time.monotonic()
+        if now < self.preview_next:return True
+        self.preview_next = now+self.preview_interval
         stop, _, _ = self.camera.gestures.snapshot()
         if self.stop_sequence.update(stop,time.monotonic()):
             self.destroy()
@@ -704,8 +710,9 @@ class App(Gtk.Window):
 
     def draw(self, widget, cr):
         cr.save()
-        cr.set_source_rgb(.035, .06, .1)
-        cr.paint()
+        if not self.has_frame or not (self.preview_fullscreen and self.fill_preview.get_active()):
+            cr.set_source_rgb(.035, .06, .1)
+            cr.paint()
         if self.has_frame:
             if self.displayed_sequence != self.video_sequence:
                 self.rendered_frames += 1
