@@ -51,7 +51,9 @@ def describe_hand(points):
     thumb=(straight(1,2,4) and distance(4,5)>.55*palm
            and distance(4,0)>1.1*distance(2,0))
     label='';number=None
-    if all(extended):
+    if not extended[0] and all(extended[1:]) and distance(4,8)<.30*palm:
+        label='OK'
+    elif all(extended):
         label='张开手掌';number=5 if thumb else 4
     elif extended == [True,True,False,False]:
         label='胜利手势'
