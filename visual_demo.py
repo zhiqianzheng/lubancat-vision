@@ -10,6 +10,7 @@ class VisualDemo:
         self.mode='normal';self.color=0;self.scene=None
         self.surface=None;self.particle_surface=None;self.glow_masks={};self.pending=[];self.clear_pending=True;self.points_drawn=0
         self.cursor=None;self.target=None;self.pen=False
+        self.pen_seen=None;self.pen_release=None
         self.center=None;self.radius=45.;self.particles=[];self.credit=0.
         self.last_tick=None;self.last_sample=None;self.pose='';self.pose_since=0.;self.fired=False
         self.tracking=False;self.enabled=True;self.error='';self.notice='';self.notice_until=0.
@@ -29,6 +30,36 @@ class VisualDemo:
     def clear(self):
         self.pending.clear();self.clear_pending=True;self.points_drawn=0
         self.cursor=self.target=None;self.pen=False
+        self.pen_seen=self.pen_release=None
+
+    @staticmethod
+    def _index_pose(points):
+        def extended(base):
+            a,b,c=points[base],points[base+1],points[base+3]
+            u=[float(a[i]-b[i]) for i in range(3)]
+            v=[float(c[i]-b[i]) for i in range(3)]
+            length=math.sqrt(sum(x*x for x in u)*sum(x*x for x in v))
+            tip=sum(float(c[i]-points[0][i])**2 for i in range(3))
+            joint=sum(float(b[i]-points[0][i])**2 for i in range(3))
+            return length>1e-6 and sum(x*y for x,y in zip(u,v))/length<-.75 and tip>1.2*joint
+        return extended(5) and not any(extended(base) for base in (9,13,17))
+
+    def _update_pen(self,result,now):
+        label=result['label'];points=result['points']
+        # Bridge the model's brief label-stability blanks only when geometry agrees.
+        drawing=label=='食指向上' or (not label and self.pen and self._index_pose(points))
+        if drawing:
+            target=(max(0.,min(639.,float(points[8][0]))),max(0.,min(479.,float(points[8][1]))))
+            gap=now-self.pen_seen if self.pen_seen is not None else 0.
+            jump=math.hypot(target[0]-self.cursor[0],target[1]-self.cursor[1]) if self.cursor is not None else 0.
+            limit=min(320.,80.+1000.*max(.05,gap))
+            if not self.pen or self.cursor is None or gap>.65 or jump>limit:self.cursor=target
+            self.pen=True;self.target=target;self.pen_seen=now;self.pen_release=None
+        elif label:
+            if self.pen_release is None:self.pen_release=now
+            if now-self.pen_release>=.18:
+                self.pen=False;self.cursor=self.target=None
+        else:self.pen_release=None
 
     def update(self,result,enabled,error,now):
         if not self.active:return False
@@ -40,7 +71,9 @@ class VisualDemo:
             return self.scene.update(result if enabled and not error else None,now)
         self.tracking=bool(enabled and not error and result is not None)
         if not self.tracking:
-            self.pen=False;self.cursor=self.target=None;self.pose='';self.last_sample=None
+            if self.mode!='paint' or not enabled or error:
+                self.pen=False;self.cursor=self.target=None
+            self.pose='';self.last_sample=None
         elif result.get('sample_id')!=self.last_sample:
             self.last_sample=result.get('sample_id');label=result['label'];points=result['points']
             if label!=self.pose:
@@ -51,14 +84,7 @@ class VisualDemo:
             if self.mode=='paint':
                 if label=='张开手掌' and now-self.pose_since>=.8 and not self.fired:
                     self.clear();self.fired=True;self.notice='画布已清空';self.notice_until=now+1.3
-                was_pen=self.pen
-                self.pen=label=='食指向上'
-                if self.pen:
-                    target=(max(0.,min(639.,float(points[8][0]))),max(0.,min(479.,float(points[8][1]))))
-                    if not was_pen or self.cursor is None or math.hypot(target[0]-self.cursor[0],target[1]-self.cursor[1])>150:
-                        self.cursor=target
-                    self.target=target
-                else:self.cursor=self.target=None
+                self._update_pen(result,now)
             else:
                 center=tuple(sum(float(points[i][axis]) for i in (0,5,9,13,17))/5. for axis in (0,1))
                 center=(max(0.,min(639.,center[0])),max(0.,min(479.,center[1])))
@@ -66,11 +92,13 @@ class VisualDemo:
                 else:self.center=tuple(a*.45+b*.55 for a,b in zip(self.center,center))
                 self.radius=max(22.,min(70.,math.hypot(float(points[9][0]-points[0][0]),float(points[9][1]-points[0][1]))*.7))
         if self.mode=='paint':
+            if self.pen_seen is None or now-self.pen_seen>.65:
+                self.pen=False;self.cursor=self.target=None
             if self.pen and self.target is not None:
                 previous=self.cursor
                 a=1.-math.exp(-dt/0.065)
                 self.cursor=tuple(x+(y-x)*a for x,y in zip(self.cursor,self.target))
-                if self.points_drawn<6000 and math.hypot(self.cursor[0]-previous[0],self.cursor[1]-previous[1])>.1:
+                if len(self.pending)<512 and math.hypot(self.cursor[0]-previous[0],self.cursor[1]-previous[1])>.1:
                     self.pending.append((previous,self.cursor,PALETTE[self.color]));self.points_drawn+=1
             return True
         self._particles(dt,now)
@@ -189,6 +217,5 @@ class VisualDemo:
         if not self.enabled:return '演示：请开启手势识别'
         if self.notice and now<self.notice_until:return self.notice
         if self.mode=='paint':
-            if self.points_drawn>=6000:return '画布已满：张开手掌保持一秒清空'
             return '画画：食指画 · 握拳停 · 张掌清空 · 比耶换色'
         return '粒子：张掌释放 · 握拳聚拢 · 比耶换色'

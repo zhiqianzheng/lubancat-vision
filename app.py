@@ -785,6 +785,7 @@ class App(Gtk.Window):
         hand = self.demo.mode in ('normal','paint','particles','pinch','bricks')
         self.gesture_toggle.set_sensitive(hand)
         self.camera.gestures.set_enabled(hand and self.gesture_toggle.get_active())
+        self.camera.gestures.idle = .3 if self.demo.mode == 'paint' else 1.
         self.camera.body.set_enabled(self.demo.mode == 'body')
         self.camera.motion.set_enabled(self.demo.mode == 'pinch' and self.gesture_toggle.get_active())
 
