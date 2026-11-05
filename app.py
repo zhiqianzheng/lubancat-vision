@@ -300,7 +300,7 @@ class App(Gtk.Window):
         self.preview_interval = 1./24
         self.preview_next = 0.
         self.gpu_enabled = os.environ.get('LIMAN_GPU_PREVIEW','1')=='1'
-        self.gpu_fps = 30 if os.environ.get('LIMAN_GPU_FPS','20')=='30' else 20
+        self.gpu_fps = 20 if os.environ.get('LIMAN_GPU_FPS','30')=='20' else 30
         self.gpu=None;self.gpu_active=False;self.gpu_started=0.;self.gpu_completed=0
         self.gpu_overlay=False
         self.video_sequence, self.displayed_sequence = 0, -1
