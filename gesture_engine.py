@@ -31,6 +31,9 @@ def main():
         if result is not None:
             result['number']=numbers.update(result.get('number'),started)
             name=result['label']
+            # Fullscreen edges debounce fresh observations themselves; avoid
+            # adding the display-label delay to that independent control path.
+            result['fullscreen_label']=name if name in ('握拳','张开手掌') else ''
             if name!=candidate:candidate=name;since=started
             result['label']=name if name and started-since>=.18 else ''
             result['points']=result['points'].tolist();result['box']=result['box'].tolist()

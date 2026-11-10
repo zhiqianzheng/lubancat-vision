@@ -362,7 +362,7 @@ class App(Gtk.Window):
         controls.pack_start(self.video_stats, False, False, 0)
         self.gesture_toggle = Gtk.ToggleButton(label='手势识别')
         self.gesture_toggle.set_active(True)
-        self.gesture_toggle.set_tooltip_text('握拳→张开手掌进入全屏；张开手掌→握拳退出全屏。双手张掌保持约两秒退出程序；关闭普通手势后 STOP 仍可用。')
+        self.gesture_toggle.set_tooltip_text('仅普通 YOLO 模式：握拳→张开手掌进入全屏；张开手掌→握拳退出全屏。双手张掌保持约两秒退出程序；关闭普通手势后 STOP 仍可用。')
         self.gesture_toggle.connect('toggled', lambda *_: self.configure_interaction_workers())
         controls.pack_start(self.gesture_toggle, False, False, 0)
         self.demo_enable = Gtk.ToggleButton(label='互动：关')
@@ -865,8 +865,8 @@ class App(Gtk.Window):
         monitor = not (hand and self.gesture_toggle.get_active())
         self.camera.gestures.set_enabled(True)
         self.camera.gestures.set_monitor_only(monitor)
-        self.camera.gestures.interval = .5 if monitor else .3
-        self.camera.gestures.idle = .5 if monitor else .3 if self.demo.mode == 'paint' else 1.
+        self.camera.gestures.interval = .5 if monitor else .12 if self.demo.mode == 'normal' else .3
+        self.camera.gestures.idle = .5 if monitor else .25 if self.demo.mode == 'normal' else .3 if self.demo.mode == 'paint' else 1.
         self.camera.body.set_enabled(self.demo.mode == 'body')
         self.camera.motion.set_enabled(self.demo.mode == 'pinch' and self.gesture_toggle.get_active())
 
@@ -927,12 +927,14 @@ class App(Gtk.Window):
             self.demo_enable.set_active(True)
 
     def apply_gesture_fullscreen(self):
-        if self.demo.active:
+        if self.demo.mode != 'normal':
+            self.gesture_sequence.reset()
+            self.gesture_notice = ''
             return
         result, enabled, error = self.hand_snapshot()
         now = time.monotonic()
         action = self.gesture_sequence.update(
-            result['label'] if result else '',
+            result.get('fullscreen_label', result['label']) if result else '',
             result.get('sample_id') if result else None,
             now, enabled and not error)
         if not enabled or error:

@@ -97,7 +97,7 @@ class CoveredLensReset:
 
 class FullscreenGestureSequence:
     """Accept deliberate fist/palm edges from distinct, stable inference samples."""
-    def __init__(self, hold=.25, gap=3., cooldown=1.):
+    def __init__(self, hold=.08, gap=3., cooldown=.25):
         self.hold, self.gap, self.cooldown = hold, gap, cooldown
         self.reset()
 
