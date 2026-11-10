@@ -4,6 +4,74 @@
 
 默认通过 **Mali-G52 GPU 流畅档**显示预览，支持开机全屏、数字＋OK 开启互动、遮住镜头复位，以及双手 STOP 退出程序。GPU 不可用时自动回退到标准预览。
 
+## 新板快速部署
+
+`deploy.py` 可安装系统依赖、下载并校验模型/运行库、创建私有 Python 依赖环境，以及配置开机服务。**前提是板子的厂商系统和摄像头驱动已经就绪；它不是系统烧录工具。**
+
+### 前置环境
+
+| 项目 | 要求 |
+|---|---|
+| 开发板 | 已验证 LubanCat-2 v3 / RK3568，aarch64 Linux；其他型号尚未验证 |
+| 系统 | 厂商 Debian 10，内核版本为 `4.19.232`，使用 `/usr/bin/python3`，版本为 Python 3.7 |
+| 摄像头 | OV8858 接 CSI **CAM1**，设备树已启用；存在 `/dev/v4l/by-path/platform-rkisp-vir1-video-index0`，`rkaiq_3A.service` 正在运行 |
+| NPU | 厂商 RKNPU 驱动已加载；所有预览模式的 YOLO 检测都需要 NPU |
+| GPU | 默认使用匹配的 Mali-G52 X11 驱动、`libmali.so.1` 和可访问的 `/dev/mali0`；可用 `--cpu-preview` 改为标准预览 |
+| 桌面与用户 | 使用 X11 / LightDM，准备一个已有的普通桌面用户；以下以 `cat` 为例，需要 root 或 sudo 权限安装 |
+| 网络与空间 | 首次联网安装需能访问现有 APT 源、GitHub、PyPI、Google 模型存储及 Kaggle；运行时 `/dev/shm` 需有约 40 MiB 可用空间 |
+
+安装器会检查板型、系统、摄像头节点及 ISP/NPU 前置条件。不会自动烧录内核、修改设备树或替换厂商 GPU 驱动。缺少摄像头节点时，请先按厂商说明启用 OV8858 CAM1 并重启；仅插入排线或执行 `pip install` 不能补齐这些条件。
+
+### 获取源码并安装
+
+在开发板执行；若尚未安装 Git，先通过系统包管理器安装 `git`：
+
+```bash
+git clone https://github.com/zhiqianzheng/lubancat-vision.git
+cd lubancat-vision
+sudo /usr/bin/python3 deploy.py install --user cat --autologin
+```
+
+将 `cat` 换成实际桌面用户名。应用默认安装到 `/opt/liman-checkin`，服务为 `liman-checkin.service`。`--autologin` 会配置 LightDM 下次自动登录该用户，并将默认启动目标设为图形桌面；**不会立即重启板子或当前桌面**。已有 LightDM 主配置指定其他自动登录用户时会报错，需先核对配置。
+
+安装成功后，下次正常启动并进入桌面时自动打开应用。如果该用户**已经登录 `:0` X11 桌面**，可在首次安装命令后加 `--start` 立即启动。不要从 `/opt/liman-checkin` 内执行安装，应保留独立的源码 checkout。
+
+安装器从现有 APT 源安装系统依赖，并将 NumPy `1.21.6`、TFLite Runtime `2.11.0` 放入应用的私有 `gesture-runtime/`，不升级系统 NumPy。模型、RKNN 运行库及 wheel 均使用固定 SHA-256 校验，校验失败不会发布新应用。系统 APT 包未做跨厂商镜像的精确版本锁定，实际版本会写入部署记录；Debian 10 已归档，APT 失败时需检查厂商源、网络和系统时间，工具不会自动改源。
+
+### 检查与实际取帧验证
+
+```bash
+sudo /usr/bin/python3 deploy.py check --user cat
+```
+
+上述检查覆盖模型哈希、Python/视频依赖、私有依赖版本、三个 TFLite 模型加载，以及设备权限和字体；不等于画面或 GPU 显示已通过现场验收。使用标准预览安装时，检查命令也应加 `--cpu-preview`。
+
+需要进一步验证摄像头和 NPU 时，先停止应用及其他占用摄像头的程序，再执行：
+
+```bash
+sudo systemctl stop liman-checkin
+sudo /usr/bin/python3 deploy.py check --user cat --smoke
+sudo systemctl start liman-checkin
+```
+
+`--smoke` 会实际读取一帧并执行一次 NPU 推理，不保存图像。最后仍需在 HDMI 屏幕确认预览、GPU 状态、手势和互动是否正常。
+
+### 离线安装与再次安装
+
+可在联网电脑上准备缓存，随后将整个缓存目录连同完整源码一起复制到板子：
+
+```bash
+python3 deploy.py download --cache ./vision-cache
+# 以下在板子上执行，路径按缓存实际位置修改
+sudo /usr/bin/python3 deploy.py install --offline --cache ./vision-cache --user cat --autologin
+```
+
+离线缓存只包含模型、RKNN 运行库和 Python wheel，**不包含系统 APT 包**；板子必须预先安装好系统依赖。重复下载会校验并复用缓存，损坏缓存不会被离线安装接受。
+
+再次安装时，若程序仍在运行，默认拒绝替换；确认可以中断后才加 `--replace-running`。原应用会保留在 `/opt/liman-checkin.previous-<版本号>`，部署记录和旧服务配置位于 `/var/lib/liman-vision-deploy/<版本号>/`。安装检查或启动失败时会尝试恢复原应用/配置；APT 包及用户组不自动回退。个人数据仍在桌面用户的主目录中，不会由安装器清空。更多参数见 `python3 deploy.py --help`。
+
+**部署工具验证范围：**真实下载及哈希校验、ARM Python 3.7 模拟环境中的私有依赖安装和模型加载、本地隔离的安装/失败恢复场景已检查；尚未在干净新板完成端到端实装、首次开机及现场画面验收。下文的原板功能验证不能替代这项验证。
+
 ## 已部署开发板：启动与关闭
 
 在开发板本机终端或 SSH 中执行：
@@ -132,6 +200,7 @@ LubanCat-2 v3 / RK3568 / Mali-G52，Debian 10，Linux 4.19.232，Python 3.7.3，
 - `hand_motion.py`：捏合模式的最新帧光流跟踪。
 - `visual_demo.py`、`interaction_games.py`：六种互动模式及其状态管理。
 - `body_engine.py`：按需加载的 MoveNet 人体关键点进程。
+- `deploy.py`：新板自动安装、依赖检查、固定哈希下载与可选摄像头/NPU 实测入口。
 - `wait_display.py`、`deploy/liman-checkin.service`：等待 X11 就绪并自动启动应用。
 
 ## 运行依赖
@@ -144,7 +213,7 @@ GPU 路径还需 X11 的 `libX11.so.6`、板卡兼容的 `libmali.so.1` 和 Mali
 
 ## 模型与 RKNN 运行库
 
-仓库不附带模型权重或二进制运行库。部署时按下表放置，先查看各上游项目的许可证与模型说明。不要用不兼容的新运行库直接替换系统运行库。当前 RKNN 模型对应私有 v1.5.2 运行库。
+仓库不附带模型权重或二进制运行库。使用 `deploy.py install` 时会自动下载并校验；手动部署时按下表放置，先查看各上游项目的许可证与模型说明。不要用不兼容的新运行库直接替换系统运行库。当前 RKNN 模型对应私有 v1.5.2 运行库。
 
 | 部署路径 | 上游下载 | SHA-256 |
 |---|---|---|
@@ -156,7 +225,9 @@ GPU 路径还需 X11 的 `libX11.so.6`、板卡兼容的 `libmali.so.1` 和 Mali
 
 人体游戏使用上表指定版本；Kaggle 下载包需解压，将其中的模型放到对应路径并核对哈希。此模型输入为 `uint8`、形状 `[1, 192, 192, 3]`。缺少该模型会影响人体游戏，其他模式可独立使用。
 
-## 板端启动
+## 手动部署与板端启动
+
+使用上方自动安装流程时，无需再手动复制文件或安装服务。以下供自行维护运行环境时参考。
 
 1. 将应用部署至 `/opt/liman-checkin`，按上表放置模型和运行库，并准备 `gesture-runtime/`。
 2. 检查 `app.py` 中 `DEVICE`；当前为 `/dev/v4l/by-path/platform-rkisp-vir1-video-index0`。
